@@ -1,0 +1,6 @@
+crawl4ai
+google-genai
+gspread
+google-auth
+pydantic
+requests
