@@ -15,6 +15,10 @@ from google.genai import types
 from google.oauth2.service_account import Credentials
 from pydantic import BaseModel, Field
 
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
+from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+from crawl4ai.deep_crawling.filters import FilterChain, URLPatternFilter
+
 # ==========================================
 # 1. CUSTOMIZE YOUR PREFERENCES HERE
 # ==========================================
@@ -59,29 +63,45 @@ def get_sheets():
 # ==========================================
 # 4. WEB SCRAPER (CRAWL4AI + JINA FALLBACK)
 # ==========================================
-async def scrape_career_page(crawler: AsyncWebCrawler, url: str) -> str:
-    run_config = CrawlerRunConfig(
-        wait_until="networkidle",
-        page_timeout=30000,
-        remove_overlay_elements=True,
+async def scrape_career_site(url: str) -> str:
+    url_filter = URLPatternFilter(
+        patterns=["*job*", "*career*", "*requisition*", "*opening*", "*position*", "*role*"]
     )
+    deep_strategy = BFSDeepCrawlStrategy(
+        max_depth=1,          # 0 = main page, 1 = main page + linked job pages
+        include_external=False,
+        max_pages=12,         # Keeps each company fast (~15-30s) and within token limits
+        filter_chain=FilterChain([url_filter]),
+    )
+    config = CrawlerRunConfig(
+        deep_crawl_strategy=deep_strategy,
+        wait_until="domcontentloaded",
+        page_timeout=25000,
+        cache_mode=CacheMode.BYPASS,
+    )
+
+    combined_markdown = []
     try:
-        result = await crawler.arun(url=url, config=run_config)
-        markdown_text = result.markdown or ""
+        async with AsyncWebCrawler() as crawler:
+            results = await crawler.arun(url=url, config=config)
+            if not isinstance(results, list):
+                results = [results]
+            for res in results:
+                if res.success and res.markdown:
+                    combined_markdown.append(f"--- SOURCE: {res.url} ---\n{res.markdown}")
     except Exception as e:
-        print(f"Crawl4AI error on {url}: {e}")
-        markdown_text = ""
+        print(f"Crawl4AI error for {url}: {e}")
 
-    if len(markdown_text.strip()) < 250:
-        print(f"Switching to Jina Reader fallback for {url}...")
-        try:
-            resp = requests.get(f"https://r.jina.ai/{url}", timeout=25)
-            if resp.status_code == 200:
-                markdown_text = resp.text
-        except Exception as e:
-            print(f"Fallback failed for {url}: {e}")
+    full_text = "\n\n".join(combined_markdown).strip()
+    if len(full_text) > 500:
+        return full_text[:45000]  # Cap length so Gemini stays fast and accurate
 
-    return markdown_text[:80000]
+    # Jina Reader fallback if Playwright was blocked by Akamai/Cloudflare
+    print(f"Switching to Jina Reader fallback for {url}...")
+    import httpx
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"https://r.jina.ai/{url}")
+        return resp.text[:45000] if resp.status_code == 200 else ""
 
 # ==========================================
 # 5. AI AGENT FILTERING (GEMINI FLASH)
