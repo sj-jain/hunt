@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import smtplib
+import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -125,22 +126,31 @@ def extract_matching_jobs(ai_client: genai.Client, company: str, base_url: str, 
     {page_markdown}
     """
 
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CareerPageExtraction,
-                temperature=0.1,
-            ),
-        )
-        parsed = CareerPageExtraction.model_validate_json(response.text)
-        return parsed.matching_jobs
-    except Exception as e:
-        print(f"Gemini extraction error for {company}: {e}")
-        return []
+    models_to_try = ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-2.5-pro"]
+    for attempt, model_name in enumerate(models_to_try, start=1):
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CareerPageExtraction,
+                    temperature=0.1,
+                ),
+            )
+            parsed = CareerPageExtraction.model_validate_json(response.text)
+            return parsed.matching_jobs
+        except Exception as e:
+            if "503" in str(e) or "429" in str(e):
+                wait_sec = attempt * 10
+                print(f"High demand ({model_name}) for {company}, retrying in {wait_sec}s...")
+                time.sleep(wait_sec)
+            else:
+                print(f"Gemini extraction error for {company}: {e}")
+                return []
 
+    print(f"Skipping {company} after 3 high-demand retries.")
+    return []
 # ==========================================
 # 6. EMAIL NOTIFICATION (GMAIL SMTP)
 # ==========================================
