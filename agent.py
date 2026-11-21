@@ -8,16 +8,14 @@ from email.mime.text import MIMEText
 from typing import List
 
 import gspread
-import requests
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+import httpx
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
+from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+from crawl4ai.deep_crawling.filters import FilterChain, URLPatternFilter
 from google import genai
 from google.genai import types
 from google.oauth2.service_account import Credentials
 from pydantic import BaseModel, Field
-
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
-from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
-from crawl4ai.deep_crawling.filters import FilterChain, URLPatternFilter
 
 # ==========================================
 # 1. CUSTOMIZE YOUR PREFERENCES HERE
@@ -61,9 +59,9 @@ def get_sheets():
     return workbook.worksheet("Targets"), workbook.worksheet("Jobs_Found")
 
 # ==========================================
-# 4. WEB SCRAPER (CRAWL4AI + JINA FALLBACK)
+# 4. WEB SCRAPER (DEEP CRAWL4AI + JINA FALLBACK)
 # ==========================================
-async def scrape_career_site(url: str) -> str:
+async def scrape_career_page(crawler, url: str) -> str:
     url_filter = URLPatternFilter(
         patterns=["*job*", "*career*", "*requisition*", "*opening*", "*position*", "*role*"]
     )
@@ -82,13 +80,12 @@ async def scrape_career_site(url: str) -> str:
 
     combined_markdown = []
     try:
-        async with AsyncWebCrawler() as crawler:
-            results = await crawler.arun(url=url, config=config)
-            if not isinstance(results, list):
-                results = [results]
-            for res in results:
-                if res.success and res.markdown:
-                    combined_markdown.append(f"--- SOURCE: {res.url} ---\n{res.markdown}")
+        results = await crawler.arun(url=url, config=config)
+        if not isinstance(results, list):
+            results = [results]
+        for res in results:
+            if res.success and res.markdown:
+                combined_markdown.append(f"--- SOURCE: {res.url} ---\n{res.markdown}")
     except Exception as e:
         print(f"Crawl4AI error for {url}: {e}")
 
@@ -98,10 +95,13 @@ async def scrape_career_site(url: str) -> str:
 
     # Jina Reader fallback if Playwright was blocked by Akamai/Cloudflare
     print(f"Switching to Jina Reader fallback for {url}...")
-    import httpx
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"https://r.jina.ai/{url}")
-        return resp.text[:45000] if resp.status_code == 200 else ""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"https://r.jina.ai/{url}")
+            return resp.text[:45000] if resp.status_code == 200 else ""
+    except Exception as e:
+        print(f"Jina fallback error for {url}: {e}")
+        return ""
 
 # ==========================================
 # 5. AI AGENT FILTERING (GEMINI FLASH)
@@ -214,15 +214,19 @@ async def main():
 
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         for row in targets:
-            company = str(row.get("Company Name", "")).strip()
-            career_url = str(row.get("Career URL", "")).strip()
+            clean_row = {str(k).strip(): str(v).strip() for k, v in row.items()}
+            company = clean_row.get("Company Name", "")
+            career_url = clean_row.get("Career URL", "")
             if not company or not career_url:
                 continue
 
             print(f"Scanning {company} -> {career_url}")
             markdown = await scrape_career_page(crawler, career_url)
-            matches = extract_matching_jobs(ai_client, company, career_url, markdown)
+            if not markdown:
+                print(f"Skipping {company}: no content retrieved.")
+                continue
 
+            matches = extract_matching_jobs(ai_client, company, career_url, markdown)
             for job in matches:
                 sig = f"{company.lower()}|{job.job_title.lower()}"
                 is_duplicate = (sig in seen_signatures) or (
